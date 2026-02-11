@@ -658,8 +658,10 @@ class WanI2VCausal:
         device_id=0,
         t5_cpu=True,
         max_cache_chunks=4,
-        sampling_steps=6,
+        sampling_steps=20,
         max_area=320 * 576,
+        guide_scale=None,
+        single_expert=False,
     ):
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -671,6 +673,9 @@ class WanI2VCausal:
         self.max_cache_chunks = max_cache_chunks
         self.sampling_steps = sampling_steps
         self.max_area = max_area
+        self.boundary = config.boundary * config.num_train_timesteps
+        self.guide_scale = guide_scale or config.sample_guide_scale  # (low, high)
+        self.sample_neg_prompt = config.sample_neg_prompt
 
         # T5 text encoder
         self.text_encoder = T5EncoderModel(
@@ -686,18 +691,34 @@ class WanI2VCausal:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        # Load only high-noise expert (no model offloading needed)
-        logging.info(f"WanI2VCausal: loading high-noise expert from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint,
-            torch_dtype=torch.bfloat16)
-        self.model.eval().requires_grad_(False)
-        self.model.to(self.device)
+        # Load both experts (both fit on A100-80GB at bf16: ~14GB each)
+        if single_expert:
+            logging.info(f"WanI2VCausal: loading high-noise expert only from {checkpoint_dir}")
+            self.high_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.high_noise_checkpoint,
+                torch_dtype=torch.bfloat16)
+            self.high_noise_model.eval().requires_grad_(False)
+            self.high_noise_model.to(self.device)
+            self.low_noise_model = None
+        else:
+            logging.info(f"WanI2VCausal: loading both experts from {checkpoint_dir}")
+            self.low_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.low_noise_checkpoint,
+                torch_dtype=torch.bfloat16)
+            self.low_noise_model.eval().requires_grad_(False)
+            self.low_noise_model.to(self.device)
+
+            self.high_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.high_noise_checkpoint,
+                torch_dtype=torch.bfloat16)
+            self.high_noise_model.eval().requires_grad_(False)
+            self.high_noise_model.to(self.device)
 
         # Streaming state
         self.frame_offset = 0  # global latent frame counter
         self._cache_initialized = False
         self._context = None  # cached text embeddings
+        self._context_null = None  # cached negative text embeddings
 
         # Precompute resolution params (fixed across chunks)
         aspect_ratio = 480 / 832  # default dashcam aspect
@@ -714,31 +735,49 @@ class WanI2VCausal:
         self._tokens_per_lat_frame = (
             self.lat_h * self.lat_w // (self.patch_size[1] * self.patch_size[2]))
 
+    def _get_model_for_timestep(self, t):
+        """Return the correct expert for this timestep."""
+        if self.low_noise_model is None:
+            return self.high_noise_model
+        if t.item() >= self.boundary:
+            return self.high_noise_model
+        return self.low_noise_model
+
     def _ensure_cache(self, lat_f_chunk):
-        """Initialize or verify KV cache is allocated."""
+        """Initialize or verify KV cache is allocated.
+
+        Only caches the low_noise_model (handles ~95% of timesteps).
+        The high_noise_model runs uncached on its 1-2 high-noise steps
+        (past context matters less at high noise levels).
+        """
         if self._cache_initialized:
             return
-        # Max tokens = max_cache_chunks worth of latent frames
         max_lat_frames = self.max_cache_chunks * lat_f_chunk
         max_tokens = max_lat_frames * self._tokens_per_lat_frame
-        self.model.init_kv_caches(
+        # Only cache the dominant expert (low_noise handles 95% of steps)
+        cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
+        cache_model.init_kv_caches(
             max_tokens=max_tokens, batch_size=1,
             device=self.device, dtype=self.param_dtype)
         self._cache_initialized = True
 
     def _encode_text(self, prompt):
-        """Encode text prompt (cached across chunks)."""
+        """Encode text + negative prompt (cached across chunks)."""
         if self._context is not None:
-            return self._context
+            return self._context, self._context_null
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([prompt], self.device)
+            context_null = self.text_encoder([self.sample_neg_prompt], self.device)
             self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
+            context_null = self.text_encoder([self.sample_neg_prompt], torch.device('cpu'))
+            context_null = [t.to(self.device) for t in context_null]
         self._context = context
-        return context
+        self._context_null = context_null
+        return context, context_null
 
     def _compute_plucker(self, c2ws, intrinsics, lat_f):
         """Compute Plucker embedding dict for a chunk."""
@@ -770,7 +809,7 @@ class WanI2VCausal:
         return {"c2ws_plucker_emb": plucker.chunk(1, dim=0)}
 
     def generate_chunk(self, img, prompt, c2ws, intrinsics,
-                       frame_num=17, shift=3.0, seed=42):
+                       frame_num=17, shift=5.0, seed=42):
         """
         Generate one video chunk with KV-cached causal inference.
 
@@ -798,7 +837,7 @@ class WanI2VCausal:
         self._ensure_cache(lat_f)
 
         # Text encoding (cached)
-        context = self._encode_text(prompt)
+        context, context_null = self._encode_text(prompt)
 
         # Plucker embeddings (chunk-local)
         dit_cond_dict = self._compute_plucker(c2ws, intrinsics, lat_f)
@@ -837,10 +876,9 @@ class WanI2VCausal:
                 shift=1, use_dynamic_shifting=False)
             scheduler.set_timesteps(self.sampling_steps, device=self.device, shift=shift)
 
-            # Phase 1: Denoise with read-only cache
+            # Phase 1: Denoise with read-only cache + MoE routing + CFG
             latent = noise
-            arg_c = {
-                'context': [context[0]],
+            base_args = {
                 'seq_len': max_seq_len,
                 'y': [y],
                 'dit_cond_dict': dit_cond_dict,
@@ -849,21 +887,43 @@ class WanI2VCausal:
             }
 
             for _, t in enumerate(tqdm(scheduler.timesteps, desc='denoise', leave=False)):
-                noise_pred = self.model(
-                    [latent.to(self.device)], t=torch.stack([t]).to(self.device),
-                    **arg_c)[0]
+                latent_model_input = [latent.to(self.device)]
+                timestep = torch.stack([t]).to(self.device)
+
+                # Select expert based on timestep
+                model = self._get_model_for_timestep(t)
+                scale = self.guide_scale[1] if t.item() >= self.boundary else self.guide_scale[0]
+
+                # Conditional forward pass
+                noise_pred_cond = model(
+                    latent_model_input, t=timestep,
+                    context=[context[0]], **base_args)[0]
+
+                # Unconditional forward pass (CFG)
+                noise_pred_uncond = model(
+                    latent_model_input, t=timestep,
+                    context=context_null, **base_args)[0]
+
+                # CFG combination
+                noise_pred = noise_pred_uncond + scale * (
+                    noise_pred_cond - noise_pred_uncond)
+
                 temp_x0 = scheduler.step(
                     noise_pred.unsqueeze(0), t, latent.unsqueeze(0),
                     return_dict=False, generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
 
             # Phase 2: Cache-fill pass with clean latent (single forward, read_write)
-            arg_fill = dict(arg_c)
-            arg_fill['use_cache'] = 'read_write'
-            # Use timestep=0 (clean signal) for cache fill
+            # Use low-noise expert for cache fill (clean signal is in its domain)
+            cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
             t_zero = torch.zeros(1, device=self.device)
-            _ = self.model(
-                [latent.to(self.device)], t=t_zero, **arg_fill)
+            _ = cache_model(
+                [latent.to(self.device)], t=t_zero,
+                context=[context[0]],
+                seq_len=max_seq_len, y=[y],
+                dit_cond_dict=dit_cond_dict,
+                frame_offset=self.frame_offset,
+                use_cache='read_write')
 
             # Advance global frame offset
             self.frame_offset += lat_f
@@ -885,13 +945,17 @@ class WanI2VCausal:
         """Reset streaming state for a new sequence."""
         self.frame_offset = 0
         self._context = None
+        self._context_null = None
         if self._cache_initialized:
-            self.model.clear_kv_caches()
+            cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
+            cache_model.clear_kv_caches()
 
     def free(self):
         """Free all cache memory."""
         self.frame_offset = 0
         self._context = None
+        self._context_null = None
         if self._cache_initialized:
-            self.model.free_kv_caches()
+            cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
+            cache_model.free_kv_caches()
             self._cache_initialized = False
