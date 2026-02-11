@@ -691,7 +691,7 @@ class WanI2VCausal:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        # Load both experts (both fit on A100-80GB at bf16: ~14GB each)
+        # Load experts
         if single_expert:
             logging.info(f"WanI2VCausal: loading high-noise expert only from {checkpoint_dir}")
             self.high_noise_model = WanModel.from_pretrained(
@@ -701,18 +701,20 @@ class WanI2VCausal:
             self.high_noise_model.to(self.device)
             self.low_noise_model = None
         else:
+            # Load both experts with offloading (one on GPU, one on CPU)
+            # Both can't fit on 80GB GPU simultaneously
             logging.info(f"WanI2VCausal: loading both experts from {checkpoint_dir}")
             self.low_noise_model = WanModel.from_pretrained(
                 checkpoint_dir, subfolder=config.low_noise_checkpoint,
                 torch_dtype=torch.bfloat16)
             self.low_noise_model.eval().requires_grad_(False)
-            self.low_noise_model.to(self.device)
+            self.low_noise_model.to(self.device)  # starts on GPU (used for most steps)
 
             self.high_noise_model = WanModel.from_pretrained(
                 checkpoint_dir, subfolder=config.high_noise_checkpoint,
                 torch_dtype=torch.bfloat16)
             self.high_noise_model.eval().requires_grad_(False)
-            self.high_noise_model.to(self.device)
+            self.high_noise_model.to('cpu')  # starts on CPU (used for ~1-2 steps)
 
         # Streaming state
         self.frame_offset = 0  # global latent frame counter
@@ -736,27 +738,38 @@ class WanI2VCausal:
             self.lat_h * self.lat_w // (self.patch_size[1] * self.patch_size[2]))
 
     def _get_model_for_timestep(self, t):
-        """Return the correct expert for this timestep."""
+        """Return the correct expert for this timestep, offloading the other."""
         if self.low_noise_model is None:
             return self.high_noise_model
         if t.item() >= self.boundary:
+            # Need high-noise expert on GPU
+            if next(self.high_noise_model.parameters()).device.type == 'cpu':
+                self.low_noise_model.to('cpu')
+                torch.cuda.empty_cache()
+                self.high_noise_model.to(self.device)
             return self.high_noise_model
-        return self.low_noise_model
+        else:
+            # Need low-noise expert on GPU
+            if next(self.low_noise_model.parameters()).device.type == 'cpu':
+                self.high_noise_model.to('cpu')
+                torch.cuda.empty_cache()
+                self.low_noise_model.to(self.device)
+            return self.low_noise_model
 
     def _ensure_cache(self, lat_f_chunk):
-        """Initialize or verify KV cache is allocated.
+        """Initialize KV cache (only for single-expert causal mode).
 
-        Only caches the low_noise_model (handles ~95% of timesteps).
-        The high_noise_model runs uncached on its 1-2 high-noise steps
-        (past context matters less at high noise levels).
+        With dual experts + offloading, KV cache is skipped (not enough GPU memory).
+        KV caching is for the post-trained single-expert causal model.
         """
+        if self._cache_initialized or self.low_noise_model is not None:
+            # Skip cache for dual-expert mode (not enough GPU memory)
+            return
         if self._cache_initialized:
             return
         max_lat_frames = self.max_cache_chunks * lat_f_chunk
         max_tokens = max_lat_frames * self._tokens_per_lat_frame
-        # Only cache the dominant expert (low_noise handles 95% of steps)
-        cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
-        cache_model.init_kv_caches(
+        self.high_noise_model.init_kv_caches(
             max_tokens=max_tokens, batch_size=1,
             device=self.device, dtype=self.param_dtype)
         self._cache_initialized = True
@@ -876,21 +889,23 @@ class WanI2VCausal:
                 shift=1, use_dynamic_shifting=False)
             scheduler.set_timesteps(self.sampling_steps, device=self.device, shift=shift)
 
-            # Phase 1: Denoise with read-only cache + MoE routing + CFG
+            # Denoise with MoE routing + CFG
+            # KV cache only used when single_expert (post-trained causal model)
+            use_kv = self._cache_initialized
             latent = noise
             base_args = {
                 'seq_len': max_seq_len,
                 'y': [y],
                 'dit_cond_dict': dit_cond_dict,
                 'frame_offset': self.frame_offset,
-                'use_cache': 'read_only',
+                'use_cache': 'read_only' if use_kv else False,
             }
 
             for _, t in enumerate(tqdm(scheduler.timesteps, desc='denoise', leave=False)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = torch.stack([t]).to(self.device)
 
-                # Select expert based on timestep
+                # Select expert based on timestep (handles offloading)
                 model = self._get_model_for_timestep(t)
                 scale = self.guide_scale[1] if t.item() >= self.boundary else self.guide_scale[0]
 
@@ -913,17 +928,20 @@ class WanI2VCausal:
                     return_dict=False, generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
 
-            # Phase 2: Cache-fill pass with clean latent (single forward, read_write)
-            # Use low-noise expert for cache fill (clean signal is in its domain)
-            cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
-            t_zero = torch.zeros(1, device=self.device)
-            _ = cache_model(
-                [latent.to(self.device)], t=t_zero,
-                context=[context[0]],
-                seq_len=max_seq_len, y=[y],
-                dit_cond_dict=dit_cond_dict,
-                frame_offset=self.frame_offset,
-                use_cache='read_write')
+                del noise_pred_cond, noise_pred_uncond, noise_pred
+                torch.cuda.empty_cache()
+
+            # Phase 2: Cache-fill (only for single-expert causal mode)
+            if use_kv:
+                cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
+                t_zero = torch.zeros(1, device=self.device)
+                _ = cache_model(
+                    [latent.to(self.device)], t=t_zero,
+                    context=[context[0]],
+                    seq_len=max_seq_len, y=[y],
+                    dit_cond_dict=dit_cond_dict,
+                    frame_offset=self.frame_offset,
+                    use_cache='read_write')
 
             # Advance global frame offset
             self.frame_offset += lat_f
