@@ -37,7 +37,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 
 @torch.amp.autocast('cuda', enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs, frame_offset=0):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -52,7 +52,7 @@ def rope_apply(x, grid_sizes, freqs):
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[0][frame_offset:frame_offset + f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
@@ -124,13 +124,69 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+        # KV cache state (allocated lazily via init_kv_cache)
+        self._cache_k = None  # [B, max_tokens, num_heads, head_dim]
+        self._cache_v = None
+        self._cache_valid_len = 0
+        self._cache_max_tokens = 0
+
+    # ----- KV cache management -----
+
+    def init_kv_cache(self, max_tokens, batch_size, device, dtype):
+        """Pre-allocate KV cache tensors."""
+        self._cache_k = torch.zeros(
+            batch_size, max_tokens, self.num_heads, self.head_dim,
+            device=device, dtype=dtype)
+        self._cache_v = torch.zeros(
+            batch_size, max_tokens, self.num_heads, self.head_dim,
+            device=device, dtype=dtype)
+        self._cache_valid_len = 0
+        self._cache_max_tokens = max_tokens
+
+    def append_to_cache(self, k, v):
+        """Append RoPE-encoded K/V to cache with FIFO eviction if full."""
+        new_len = k.shape[1]
+        total = self._cache_valid_len + new_len
+
+        if total > self._cache_max_tokens:
+            # FIFO eviction: drop oldest tokens to make room
+            keep = self._cache_max_tokens - new_len
+            if keep > 0:
+                self._cache_k[:, :keep] = self._cache_k[:, self._cache_valid_len - keep:self._cache_valid_len].clone()
+                self._cache_v[:, :keep] = self._cache_v[:, self._cache_valid_len - keep:self._cache_valid_len].clone()
+            else:
+                keep = 0
+            self._cache_valid_len = keep
+            total = self._cache_valid_len + new_len
+
+        start = self._cache_valid_len
+        self._cache_k[:, start:start + new_len] = k
+        self._cache_v[:, start:start + new_len] = v
+        self._cache_valid_len = start + new_len
+
+    def clear_kv_cache(self):
+        """Reset cache valid length to 0 (keep allocated memory)."""
+        self._cache_valid_len = 0
+
+    def free_kv_cache(self):
+        """Deallocate cache tensors entirely."""
+        self._cache_k = None
+        self._cache_v = None
+        self._cache_valid_len = 0
+        self._cache_max_tokens = 0
+
+    def forward(self, x, seq_lens, grid_sizes, freqs, frame_offset=0,
+                use_cache=False):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            frame_offset(int): Frame offset for RoPE positional encoding in cached mode.
+            use_cache: False = original bidirectional (unchanged),
+                       'read_only' = concat cached K/V + current K/V but don't persist,
+                       'read_write' = append to persistent cache after attention.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -143,12 +199,49 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        q = rope_apply(q, grid_sizes, freqs, frame_offset=frame_offset)
+        k = rope_apply(k, grid_sizes, freqs, frame_offset=frame_offset)
+
+        if use_cache and self._cache_k is not None and self._cache_valid_len > 0:
+            # Concat cached K/V with current K/V
+            cached_k = self._cache_k[:, :self._cache_valid_len]
+            cached_v = self._cache_v[:, :self._cache_valid_len]
+            k_full = torch.cat([cached_k, k[:, :seq_lens[0]]], dim=1)
+            v_full = torch.cat([cached_v, v[:, :seq_lens[0]]], dim=1)
+
+            # Pad back to max seq_len for flash_attention
+            full_len = k_full.shape[1]
+            if full_len < s:
+                pad = k_full.new_zeros(b, s - full_len, n, d)
+                k_full = torch.cat([k_full, pad], dim=1)
+                v_full = torch.cat([v_full, pad], dim=1)
+            elif full_len > s:
+                # Expand q to match k_full length for flash_attention
+                q_pad = q.new_zeros(b, full_len - s, n, d)
+                q = torch.cat([q, q_pad], dim=1)
+
+            k_lens = torch.tensor([full_len] * b, dtype=torch.long,
+                                  device=seq_lens.device)
+            x = flash_attention(
+                q=q[:, :full_len] if full_len <= q.shape[1] else q,
+                k=k_full[:, :full_len],
+                v=v_full[:, :full_len],
+                q_lens=seq_lens,
+                k_lens=k_lens,
+                window_size=self.window_size)
+        else:
+            x = flash_attention(
+                q=q,
+                k=k,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
+
+        if use_cache == 'read_write' and self._cache_k is not None:
+            # Append current chunk's K/V to persistent cache
+            self.append_to_cache(
+                k[:, :seq_lens[0]],
+                v[:, :seq_lens[0]])
 
         # output
         x = x.flatten(2)
@@ -232,6 +325,8 @@ class WanAttentionBlock(nn.Module):
         context,
         context_lens,
         dit_cond_dict=None,
+        frame_offset=0,
+        use_cache=False,
     ):
         r"""
         Args:
@@ -240,6 +335,8 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            frame_offset(int): Frame offset for RoPE in cached inference.
+            use_cache: False / 'read_only' / 'read_write' — passed to self_attn.
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -249,7 +346,8 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
+            seq_lens, grid_sizes, freqs,
+            frame_offset=frame_offset, use_cache=use_cache)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -427,6 +525,23 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
+    # ----- KV cache management (delegates to each block's self_attn) -----
+
+    def init_kv_caches(self, max_tokens, batch_size, device, dtype):
+        """Pre-allocate KV caches for all transformer blocks."""
+        for block in self.blocks:
+            block.self_attn.init_kv_cache(max_tokens, batch_size, device, dtype)
+
+    def clear_kv_caches(self):
+        """Reset all KV caches (keep allocated memory)."""
+        for block in self.blocks:
+            block.self_attn.clear_kv_cache()
+
+    def free_kv_caches(self):
+        """Deallocate all KV cache tensors."""
+        for block in self.blocks:
+            block.self_attn.free_kv_cache()
+
     def forward(
         self,
         x,
@@ -435,6 +550,8 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         y=None,
         dit_cond_dict=None,
+        frame_offset=0,
+        use_cache=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -450,6 +567,12 @@ class WanModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            frame_offset (`int`, *optional*, defaults to 0):
+                Frame offset for RoPE positional encoding in cached inference.
+            use_cache:
+                False = original bidirectional (unchanged),
+                'read_only' = use cached K/V but don't persist new tokens,
+                'read_write' = append new tokens to persistent cache.
 
         Returns:
             List[Tensor]:
@@ -497,7 +620,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
-        
+
         # cam
         if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
             c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
@@ -528,7 +651,9 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            dit_cond_dict=dit_cond_dict)
+            dit_cond_dict=dit_cond_dict,
+            frame_offset=frame_offset,
+            use_cache=use_cache)
 
         for block in self.blocks:
             x = block(x, **kwargs)
