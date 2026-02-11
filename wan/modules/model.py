@@ -208,27 +208,24 @@ class WanSelfAttention(nn.Module):
             cached_v = self._cache_v[:, :self._cache_valid_len]
             k_full = torch.cat([cached_k, k[:, :seq_lens[0]]], dim=1)
             v_full = torch.cat([cached_v, v[:, :seq_lens[0]]], dim=1)
-
-            # Pad back to max seq_len for flash_attention
             full_len = k_full.shape[1]
-            if full_len < s:
-                pad = k_full.new_zeros(b, s - full_len, n, d)
-                k_full = torch.cat([k_full, pad], dim=1)
-                v_full = torch.cat([v_full, pad], dim=1)
-            elif full_len > s:
-                # Expand q to match k_full length for flash_attention
-                q_pad = q.new_zeros(b, full_len - s, n, d)
-                q = torch.cat([q, q_pad], dim=1)
 
+            # Only pass valid query tokens — flash_attn_varlen handles
+            # different q and k lengths natively via cu_seqlens
+            q_valid = q[:, :seq_lens[0]]
             k_lens = torch.tensor([full_len] * b, dtype=torch.long,
                                   device=seq_lens.device)
             x = flash_attention(
-                q=q[:, :full_len] if full_len <= q.shape[1] else q,
-                k=k_full[:, :full_len],
-                v=v_full[:, :full_len],
-                q_lens=seq_lens,
+                q=q_valid,
+                k=k_full,
+                v=v_full,
                 k_lens=k_lens,
                 window_size=self.window_size)
+            # x is (b, seq_lens[0], n, d) — pad back to (b, s, n, d)
+            valid_len = seq_lens[0].item() if seq_lens[0].dim() == 0 else int(seq_lens[0])
+            if valid_len < s:
+                pad = x.new_zeros(b, s - valid_len, x.shape[2], x.shape[3])
+                x = torch.cat([x, pad], dim=1)
         else:
             x = flash_attention(
                 q=q,
